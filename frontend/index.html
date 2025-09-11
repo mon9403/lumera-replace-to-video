@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lumera AI – Product Replace to Video</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui,Arial;padding:24px;max-width:960px;margin:auto}
+    h1{font-size:22px;margin-bottom:8px}
+    .card{border:1px solid #e5e7eb;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.04)}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .col{flex:1 1 280px}
+    label{display:block;font-weight:600;margin-bottom:6px}
+    input,select,textarea,button{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:10px}
+    button{cursor:pointer;font-weight:700}
+    #status{white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace}
+    img,video{max-width:100%;border-radius:12px}
+    .mono{font-family:ui-monospace,Menlo,monospace}
+    .actions{display:flex;gap:10px;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+  <h1>💡 Lumera AI – Product Replace to Video</h1>
+  <p>Upload a reference scene (with the old product) and a new product photo. We'll composite, draft a Kling prompt, and render a short video.</p>
+
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <label>Reference scene (old product)</label>
+        <input type="file" id="reference" accept="image/*" />
+      </div>
+      <div class="col">
+        <label>Replacement product</label>
+        <input type="file" id="replacement" accept="image/*" />
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>Aspect ratio</label>
+        <select id="aspect">
+          <option value="9:16" selected>9:16 (vertical)</option>
+          <option value="1:1">1:1</option>
+          <option value="16:9">16:9 (landscape)</option>
+        </select>
+      </div>
+      <div class="col">
+        <label>Duration (seconds)</label>
+        <input type="number" id="duration" min="3" max="10" value="5" />
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>Notes (optional)</label>
+        <textarea id="notes" rows="3" placeholder="Placement hints, style notes, etc."></textarea>
+      </div>
+    </div>
+    <div class="row actions">
+      <button id="go">Generate</button>
+      <button id="share" disabled>Make share link</button>
+      <input id="shareUrl" readonly placeholder="Share URL will appear here" />
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>🖼️ Composite Preview</h3>
+    <img id="composite" alt="Composite preview" />
+  </div>
+
+  <div class="card">
+    <h3>🎬 Kling Prompt</h3>
+    <pre id="prompt" class="mono"></pre>
+  </div>
+
+  <div class="card">
+    <h3>📡 Status</h3>
+    <div id="status">Idle.</div>
+  </div>
+
+  <div class="card">
+    <h3>📺 Final Video</h3>
+    <video id="video" controls playsinline></video>
+  </div>
+
+  <script>
+    // For separate hosting, set your backend URL here explicitly:
+    const apiBase = location.origin; // e.g., 'https://api.lumera.xyz'
+    const el = (id) => document.getElementById(id);
+
+    let lastTaskId = null;
+    let lastCompositeUrl = null;
+    let lastPrompt = null;
+
+    async function compose() {
+      const reference = el('reference').files[0];
+      const replacement = el('replacement').files[0];
+      const aspect = el('aspect').value;
+      const duration = el('duration').value;
+      const notes = el('notes').value;
+
+      if (!reference || !replacement) {
+        alert('Please choose both images.');
+        return;
+      }
+
+      const fd = new FormData();
+      fd.append('reference', reference);
+      fd.append('replacement', replacement);
+      fd.append('aspect', aspect);
+      fd.append('duration', duration);
+      if (notes) fd.append('notes', notes);
+
+      el('status').textContent = 'Uploading & composing...';
+
+      const r = await fetch(`${apiBase}/api/compose`, { method: 'POST', body: fd });
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error('Compose failed: ' + t);
+      }
+      const data = await r.json();
+      console.log('compose ->', data);
+
+      el('composite').src = data.composite_url;
+      el('prompt').textContent = data.prompt;
+      lastTaskId = data.task_id;
+      lastCompositeUrl = data.composite_url;
+      lastPrompt = data.prompt;
+
+      el('share').disabled = false;
+
+      if (data.task_id) {
+        pollTask(data.task_id);
+      } else {
+        el('status').textContent = 'No task_id returned.';
+      }
+    }
+
+    async function pollTask(taskId) {
+      el('status').textContent = 'Kling task created. Polling...';
+      let tries = 0;
+
+      const tick = async () => {
+        tries++;
+        const r = await fetch(`${apiBase}/api/task/${taskId}`);
+        if (!r.ok) {
+          const t = await r.text();
+          el('status').textContent = 'Task error: ' + t;
+          return;
+        }
+        const data = await r.json();
+        const s = data.status || 'unknown';
+        el('status').textContent = `Attempt ${tries}: ${s}`;
+
+        if (s.toLowerCase().includes('completed') || s.toLowerCase() === 'succeeded' || data.video_url) {
+          if (data.video_url) {
+            el('video').src = data.video_url;
+            el('status').textContent = '✅ Completed.';
+          } else {
+            el('status').textContent = 'Completed but missing video URL.';
+          }
+          return;
+        }
+        if (s.toLowerCase().includes('failed') || s.toLowerCase().includes('error')) {
+          el('status').textContent = '❌ Failed: ' + (data.detail || '');
+          return;
+        }
+        setTimeout(tick, 3000);
+      };
+      tick();
+    }
+
+    async function makeShareLink() {
+      if (!lastCompositeUrl || !lastTaskId) {
+        alert('Run a generation first.');
+        return;
+      }
+      const payload = { task_id: lastTaskId, composite_url: lastCompositeUrl, prompt: lastPrompt };
+      const r = await fetch(`${apiBase}/api/share`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        alert('Share failed: ' + (data.detail || r.statusText));
+        return;
+      }
+      document.getElementById('shareUrl').value = data.url;
+    }
+
+    document.getElementById('go').addEventListener('click', () => {
+      compose().catch(err => {
+        console.error(err);
+        document.getElementById('status').textContent = 'Error: ' + err.message;
+      });
+    });
+
+    document.getElementById('share').addEventListener('click', makeShareLink);
+  </script>
+</body>
+</html>
