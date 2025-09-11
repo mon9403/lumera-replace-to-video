@@ -87,7 +87,7 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
     Compose via Responses API using gpt-4.1 + image_generation tool.
     Returns base64 PNG (no data URL).
     """
-    import base64
+    import base64, json, sys
 
     def to_data_url(b: bytes, mime="image/png"):
         return f"data:{mime};base64," + base64.b64encode(b).decode("utf-8")
@@ -98,7 +98,7 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
     prompt = (
         "Replace the old product in the scene (first image) with the new product from the second image. "
         "Match perspective, lighting, shadows, and reflections. Maintain the original background. "
-        "Place the new product naturally where the old one was; remove any remnants. Output a clean photorealistic composite."
+        f"Output a clean photorealistic composite (target size {target_size})."
     )
 
     resp = client.responses.create(
@@ -111,37 +111,63 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
                 {"type": "input_image", "image_url": rep_data_url},
             ],
         }],
-                    tools=[{
-                            "type": "image_generation",
-                            "size": "1024x1536",
-                            "quality": "high",
-                            "output_format": "png"
-                        }],
+        tools=[{"type": "image_generation", "model": "gpt-image-1"}],
+        tool_choice={"type": "image_generation"},
     )
 
-    # Extract base64 image payload
-    b64 = None
-    try:
-        items = getattr(resp, "output", None) or []
-        for item in items:
-            itype = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
-            if itype != "message":
-                continue
-            content = getattr(item, "content", None) or (item.get("content") if isinstance(item, dict) else [])
-            for c in content:
-                ctype = getattr(c, "type", None) or (c.get("type") if isinstance(c, dict) else None)
-                if ctype == "output_image":
-                    img = getattr(c, "image", None) or (c.get("image") if isinstance(c, dict) else None)
-                    if img:
-                        b64 = getattr(img, "b64_json", None) or (img.get("b64_json") if isinstance(img, dict) else None)
-                        if b64:
-                            break
-            if b64:
-                break
-    except Exception:
-        pass
+    # ---- Robust extraction: try multiple known shapes ----
+    def _extract_b64(o) -> str | None:
+        # 1) Newer SDK: resp.output -> list[message]; content -> list[output_image]
+        out = getattr(o, "output", None)
+        if out:
+            for item in out:
+                itype = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
+                content = getattr(item, "content", None) or (isinstance(item, dict) and item.get("content")) or []
+                if itype == "message" and content:
+                    for c in content:
+                        ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
+                        if ctype == "output_image":
+                            img = getattr(c, "image", None) or (isinstance(c, dict) and c.get("image")) or {}
+                            b64 = getattr(img, "b64_json", None) or (isinstance(img, dict) and img.get("b64_json"))
+                            if b64:
+                                return b64
 
+        # 2) Some variants: resp.output[0].content is a dict with "image"
+        try:
+            d = o.model_dump() if hasattr(o, "model_dump") else None
+        except Exception:
+            d = None
+        if isinstance(d, dict):
+            # Walk everything to find any key named b64_json
+            stack = [d]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    if "b64_json" in cur and isinstance(cur["b64_json"], str):
+                        return cur["b64_json"]
+                    stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+        return None
+
+    b64 = _extract_b64(resp)
+
+    # Optional: log a compact sample of the response if extraction failed (helps once, then you can remove)
     if not b64:
+        try:
+            sample = resp.model_dump() if hasattr(resp, "model_dump") else {}
+            # Trim huge blobs before logging
+            def _trim(x):
+                if isinstance(x, dict):
+                    return {k: _trim(v) for k, v in list(x.items())[:10]}
+                if isinstance(x, list):
+                    return [_trim(v) for v in x[:5]]
+                if isinstance(x, str) and len(x) > 200:
+                    return x[:200] + "...(trimmed)"
+                return x
+            print("DEBUG compose_with_openai resp sample:", json.dumps(_trim(sample))[:4000], file=sys.stderr)
+        except Exception:
+            pass
         raise RuntimeError("No image returned from image_generation tool")
 
     return b64
