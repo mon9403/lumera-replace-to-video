@@ -82,6 +82,44 @@ def new_slug(n=6):
 # ----------------------
 # Helpers
 # ----------------------
+
+@app.get("/api/debug/compose-shape")
+def debug_compose_shape():
+    import base64
+    ref_bytes = b"fake"
+    rep_bytes = b"fake"
+    try:
+        ref_data_url = "data:image/png;base64," + base64.b64encode(ref_bytes).decode("utf-8")
+        rep_data_url = "data:image/png;base64," + base64.b64encode(rep_bytes).decode("utf-8")
+        resp = client.responses.create(
+            model="gpt-4.1",
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "test"},
+                    {"type": "input_image", "image_url": ref_data_url},
+                    {"type": "input_image", "image_url": rep_data_url},
+                ],
+            }],
+            tools=[{"type": "image_generation", "model": "gpt-image-1"}],
+            tool_choice={"type": "image_generation"},
+        )
+        # Dump trimmed structure
+        d = resp.model_dump() if hasattr(resp, "model_dump") else resp
+        import json
+        def trim(x):
+            if isinstance(x, dict):
+                return {k: trim(v) for k, v in list(x.items())[:5]}
+            if isinstance(x, list):
+                return [trim(v) for v in x[:3]]
+            if isinstance(x, str) and len(x) > 150:
+                return x[:150]+"...(trim)"
+            return x
+        return trim(d)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target_size: str = "1024x1024") -> str:
     """
     Compose via Responses API using gpt-4.1 + image_generation tool.
