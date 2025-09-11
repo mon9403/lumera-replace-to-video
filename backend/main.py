@@ -4,16 +4,13 @@ import json
 import httpx
 import sqlite3
 import secrets
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
-
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic_settings import BaseSettings
 from openai import OpenAI
 
@@ -36,7 +33,7 @@ settings = Settings()
 
 app = FastAPI(title="Lumera AI – Product Replace to Video")
 
-# CORS (adjust origins later for production)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,14 +46,6 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-FRONTEND_DIR = (BASE_DIR.parent / "frontend")
-if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-else:
-    @app.get("/", response_class=HTMLResponse)
-    async def root():
-        return "<h1>Lumera API</h1><p>Frontend folder not found. Try /api/health or /docs.</p>"
 
 # Serve outputs statically
 app.mount("/outputs", StaticFiles(directory=str(OUT_DIR)), name="outputs")
@@ -95,8 +84,8 @@ def new_slug(n=6):
 # ----------------------
 def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target_size: str = "1024x1024") -> str:
     """
-    Compose the replacement product into the reference scene via Responses API
-    using gpt-4.1 + image_generation tool. Returns base64 PNG (no data URL).
+    Compose via Responses API using gpt-4.1 + image_generation tool.
+    Returns base64 PNG (no data URL).
     """
     import base64
 
@@ -112,7 +101,6 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
         "Place the new product naturally where the old one was; remove any remnants. Output a clean photorealistic composite."
     )
 
-    # Use the Responses API with the image_generation tool
     resp = client.responses.create(
         model="gpt-4.1",
         input=[{
@@ -126,21 +114,22 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
         tools=[{"type": "image_generation", "image": {"size": target_size}}],
     )
 
-    # Extract the generated image (base64)
-    # The SDK returns tool output items; find the first image.
-    # Depending on SDK minor versions, the shape can differ slightly.
-    out = resp.output if hasattr(resp, "output") else resp  # be tolerant
-    # Walk the structure to find a b64 image
+    # Extract base64 image payload
     b64 = None
     try:
-        for item in out:  # list of output items
-            if getattr(item, "type", "") == "message":
-                for c in getattr(item, "content", []):
-                    if getattr(c, "type", "") == "output_image":
-                        # c.image is an object with b64_json
-                        img_obj = getattr(c, "image", None)
-                        if img_obj and getattr(img_obj, "b64_json", None):
-                            b64 = img_obj.b64_json
+        items = getattr(resp, "output", None) or []
+        for item in items:
+            itype = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+            if itype != "message":
+                continue
+            content = getattr(item, "content", None) or (item.get("content") if isinstance(item, dict) else [])
+            for c in content:
+                ctype = getattr(c, "type", None) or (c.get("type") if isinstance(c, dict) else None)
+                if ctype == "output_image":
+                    img = getattr(c, "image", None) or (c.get("image") if isinstance(c, dict) else None)
+                    if img:
+                        b64 = getattr(img, "b64_json", None) or (img.get("b64_json") if isinstance(img, dict) else None)
+                        if b64:
                             break
             if b64:
                 break
@@ -148,26 +137,10 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
         pass
 
     if not b64:
-        # Fallback for alt shapes (older/newer SDKs)
-        # Try to look for dicts
-        try:
-            for item in out:
-                if isinstance(item, dict) and item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_image":
-                            img_obj = c.get("image") or {}
-                            b64 = img_obj.get("b64_json")
-                            break
-                if b64:
-                    break
-        except Exception:
-            pass
-
-    if not b64:
         raise RuntimeError("No image returned from image_generation tool")
 
     return b64
-    
+
 def draft_kling_prompt_with_openai(scene_notes: str, aspect: str, duration: int) -> str:
     sys = (
         "You are a creative director writing concise prompts for Kling v2.1. "
@@ -178,13 +151,6 @@ Create a cinematic animation prompt for Kling v2.1.
 Aspect: {aspect}
 Duration: {duration}s
 Scene details / product context: {scene_notes}
-
-Structure:
-- Camera: one primary move + subtle secondary motion.
-- Environment motion: 1–2 tasteful effects (particles, light rays, gentle wind).
-- Subject motion: small parallax, slow spin, or reflective shimmer—avoid warping.
-- Lighting: specify source, color temp, contrast, and any glow.
-- Safety: photorealistic, no text, no extra objects.
 """
     r = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -233,8 +199,8 @@ async def get_kling_task(task_id: str) -> dict:
 # ----------------------
 @app.post("/api/compose", response_model=ComposeResponse)
 async def compose(
-    reference: UploadFile = File(..., description="Reference scene with old product"),
-    replacement: UploadFile = File(..., description="New product photo"),
+    reference: UploadFile = File(...),
+    replacement: UploadFile = File(...),
     aspect: str = Form("9:16"),
     duration: int = Form(5),
     notes: Optional[str] = Form(None),
@@ -254,17 +220,10 @@ async def compose(
 
     composite_url = f"{settings.SPACE_HOST}/outputs/{composite_name}"
 
-    scene_notes = notes or "Product placed naturally into the reference scene; preserve realism."
-    try:
-        prompt = draft_kling_prompt_with_openai(scene_notes, aspect, duration)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prompt generation failed: {e}")
+    scene_notes = notes or "Product placed naturally into the reference scene."
+    prompt = draft_kling_prompt_with_openai(scene_notes, aspect, duration)
 
-    try:
-        task_id = await create_kling_task(prompt, composite_url, aspect, duration)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Kling task creation failed: {e}")
-
+    task_id = await create_kling_task(prompt, composite_url, aspect, duration)
     return ComposeResponse(composite_url=composite_url, task_id=task_id, prompt=prompt)
 
 @app.get("/api/task/{task_id}", response_model=TaskResponse)
@@ -275,7 +234,6 @@ async def task_status(task_id: str):
     detail = json.dumps(data)
     return TaskResponse(status=status, video_url=video_url, detail=detail)
 
-# ---- Sharing ----
 @app.post("/api/share")
 async def create_share(payload: dict):
     task_id = payload.get("task_id")
@@ -283,13 +241,10 @@ async def create_share(payload: dict):
     prompt = payload.get("prompt")
     if not (task_id and composite_url):
         raise HTTPException(status_code=400, detail="task_id and composite_url required")
-
     slug = new_slug()
     with db() as c:
-        c.execute(
-            "INSERT INTO shares(slug, task_id, composite_url, prompt) VALUES(?,?,?,?)",
-            (slug, task_id, composite_url, prompt or ""),
-        )
+        c.execute("INSERT INTO shares(slug, task_id, composite_url, prompt) VALUES(?,?,?,?)",
+                  (slug, task_id, composite_url, prompt or ""))
         c.commit()
     return {"slug": slug, "url": f"{settings.SPACE_HOST}/v/{slug}"}
 
@@ -301,66 +256,25 @@ async def view_share(slug: str):
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
     task_id, composite_url, prompt = row
-
     data = await get_kling_task(task_id)
-    status = (data.get("status") or data.get("state") or "unknown").lower()
     video_url = data.get("video_url") or (data.get("result", {}) if isinstance(data.get("result"), dict) else {}).get("url") or ""
+    return HTMLResponse(f"<h1>Share</h1><img src='{composite_url}' /><pre>{prompt}</pre><video src='{video_url}' controls></video>")
 
-    title = "Lumera AI – Product Replace to Video"
-    desc = f"Status: {status.upper()}"
+# ----------------------
+# Serve frontend (after APIs, avoids swallowing POST)
+# ----------------------
+FRONTEND_DIR = (BASE_DIR.parent / "frontend")
+if FRONTEND_DIR.exists():
+    app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
-    def esc(s): 
-        return (s or "").replace("<","&lt;").replace(">","&gt;")
+    @app.get("/", response_class=FileResponse)
+    async def root():
+        return FileResponse(FRONTEND_DIR / "index.html")
+else:
+    @app.get("/", response_class=HTMLResponse)
+    async def root_fallback():
+        return HTMLResponse("<h1>Lumera API</h1><p>Frontend not found. Try /api/health or /docs.</p>")
 
-    html = f"""
-    <!doctype html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>{esc(title)}</title>
-      <meta property="og:title" content="{esc(title)}" />
-      <meta property="og:description" content="{esc(desc)}" />
-      <meta property="og:type" content="video.other" />
-      <meta property="og:image" content="{video_url or composite_url}" />
-      <meta property="twitter:card" content="summary_large_image" />
-      <meta property="twitter:title" content="{esc(title)}" />
-      <meta property="twitter:description" content="{esc(desc)}" />
-      <meta property="twitter:image" content="{video_url or composite_url}" />
-      <style>
-        body{{font-family:ui-sans-serif,system-ui,Arial;padding:24px;max-width:720px;margin:auto}}
-        .card{{border:1px solid #e5e7eb;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
-        img,video{{max-width:100%;border-radius:12px}}
-        pre{{white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace}}
-      </style>
-    </head>
-    <body>
-      <h1>🔗 Share – Lumera AI</h1>
-      <div class="card">
-        <h3>🖼️ Composite</h3>
-        <img src="{composite_url}" alt="Composite" />
-      </div>
-      <div class="card">
-        <h3>🎬 Prompt</h3>
-        <pre>{esc(prompt)}</pre>
-      </div>
-      <div class="card">
-        <h3>📺 Video</h3>
-        {f'<video controls playsinline src="{video_url}"></video>' if video_url else '<em>Rendering… refresh in a moment.</em>'}
-      </div>
-      <div class="card">
-        <a href="/">Create your own →</a>
-      </div>
-      <script>
-        const hasVideo = {str(bool(video_url)).lower()};
-        if (!hasVideo) setTimeout(() => location.reload(), 5000);
-      </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
-
-# Health
 @app.get("/api/health")
 async def health():
     return {"ok": True}
