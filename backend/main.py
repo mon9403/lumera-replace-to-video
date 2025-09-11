@@ -111,7 +111,12 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
                 {"type": "input_image", "image_url": rep_data_url},
             ],
         }],
-        tools=[{"type": "image_generation", "image": {"size": target_size}}],
+                    tools=[{
+                            "type": "image_generation",
+                            "size": "1024x1536",
+                            "quality": "high",
+                            "output_format": "png"
+                        }],
     )
 
     # Extract base64 image payload
