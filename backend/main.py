@@ -50,6 +50,14 @@ BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+FRONTEND_DIR = (BASE_DIR.parent / "frontend")
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+else:
+    @app.get("/", response_class=HTMLResponse)
+    async def root():
+        return "<h1>Lumera API</h1><p>Frontend folder not found. Try /api/health or /docs.</p>"
+
 # Serve outputs statically
 app.mount("/outputs", StaticFiles(directory=str(OUT_DIR)), name="outputs")
 
