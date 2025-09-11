@@ -95,28 +95,79 @@ def new_slug(n=6):
 # ----------------------
 def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target_size: str = "1024x1024") -> str:
     """
-    Compose the replacement product into the reference scene via OpenAI image generation.
-    Returns base64 (PNG) string without data URL prefix.
+    Compose the replacement product into the reference scene via Responses API
+    using gpt-4.1 + image_generation tool. Returns base64 PNG (no data URL).
     """
+    import base64
+
+    def to_data_url(b: bytes, mime="image/png"):
+        return f"data:{mime};base64," + base64.b64encode(b).decode("utf-8")
+
+    ref_data_url = to_data_url(reference_bytes)
+    rep_data_url = to_data_url(replacement_bytes)
+
     prompt = (
-        "Replace the old product in the scene with the new product photo. "
-        "Match perspective, lighting, shadows, and reflections. Maintain original background. "
-        "Place the new product naturally where the old one was, remove any remnants."
+        "Replace the old product in the scene (first image) with the new product from the second image. "
+        "Match perspective, lighting, shadows, and reflections. Maintain the original background. "
+        "Place the new product naturally where the old one was; remove any remnants. Output a clean photorealistic composite."
     )
 
-    # Using Images API (stable). If you prefer gpt-4.1+image_generation, swap to Responses API.
-    img = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        size=target_size,
-        image=[
-            {"name": "reference.jpg", "bytes": reference_bytes},
-            {"name": "replacement.png", "bytes": replacement_bytes},
-        ],
+    # Use the Responses API with the image_generation tool
+    resp = client.responses.create(
+        model="gpt-4.1",
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": ref_data_url},
+                {"type": "input_image", "image_url": rep_data_url},
+            ],
+        }],
+        tools=[{"type": "image_generation", "image": {"size": target_size}}],
     )
-    b64 = img.data[0].b64_json
+
+    # Extract the generated image (base64)
+    # The SDK returns tool output items; find the first image.
+    # Depending on SDK minor versions, the shape can differ slightly.
+    out = resp.output if hasattr(resp, "output") else resp  # be tolerant
+    # Walk the structure to find a b64 image
+    b64 = None
+    try:
+        for item in out:  # list of output items
+            if getattr(item, "type", "") == "message":
+                for c in getattr(item, "content", []):
+                    if getattr(c, "type", "") == "output_image":
+                        # c.image is an object with b64_json
+                        img_obj = getattr(c, "image", None)
+                        if img_obj and getattr(img_obj, "b64_json", None):
+                            b64 = img_obj.b64_json
+                            break
+            if b64:
+                break
+    except Exception:
+        pass
+
+    if not b64:
+        # Fallback for alt shapes (older/newer SDKs)
+        # Try to look for dicts
+        try:
+            for item in out:
+                if isinstance(item, dict) and item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_image":
+                            img_obj = c.get("image") or {}
+                            b64 = img_obj.get("b64_json")
+                            break
+                if b64:
+                    break
+        except Exception:
+            pass
+
+    if not b64:
+        raise RuntimeError("No image returned from image_generation tool")
+
     return b64
-
+    
 def draft_kling_prompt_with_openai(scene_notes: str, aspect: str, duration: int) -> str:
     sys = (
         "You are a creative director writing concise prompts for Kling v2.1. "
