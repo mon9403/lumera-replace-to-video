@@ -19,7 +19,7 @@ from utils import save_base64_image  # still used to persist uploads (png passth
 
 
 # ----------------------
-# Settings
+# Settingssss
 # ----------------------
 class Settings(BaseSettings):
     OPENAI_API_KEY: str
