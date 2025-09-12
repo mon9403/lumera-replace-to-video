@@ -17,6 +17,7 @@ from openai import OpenAI
 from models import ComposeResponse, TaskResponse
 from utils import save_base64_image
 
+
 # ----------------------
 # Settings
 # ----------------------
@@ -29,11 +30,12 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
+
 settings = Settings()
 
 app = FastAPI(title="Lumera AI – Product Replace to Video")
 
-# CORS
+# Allow cross-origin for quick testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,16 +44,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Files
+# Paths
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Serve outputs statically
+# Serve generated outputs
 app.mount("/outputs", StaticFiles(directory=str(OUT_DIR)), name="outputs")
 
-# OpenAI client
-client = OpenAI(api_key=settings.OPENAI_API_KEY)
+# ✅ Force correct base_url so we never hit our own Render host by mistake
+client = OpenAI(
+    api_key=settings.OPENAI_API_KEY,
+    base_url="https://api.openai.com/v1"
+)
 
 # SQLite for share links
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "shares.db")))
@@ -72,54 +77,19 @@ con.execute(
 con.commit()
 con.close()
 
+
 def db():
     return sqlite3.connect(DB_PATH)
+
 
 def new_slug(n=6):
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
     return ''.join(secrets.choice(alphabet) for _ in range(n))
 
+
 # ----------------------
 # Helpers
 # ----------------------
-
-@app.get("/api/debug/compose-shape")
-def debug_compose_shape():
-    import base64
-    ref_bytes = b"fake"
-    rep_bytes = b"fake"
-    try:
-        ref_data_url = "data:image/png;base64," + base64.b64encode(ref_bytes).decode("utf-8")
-        rep_data_url = "data:image/png;base64," + base64.b64encode(rep_bytes).decode("utf-8")
-        resp = client.responses.create(
-            model="gpt-4.1",
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "test"},
-                    {"type": "input_image", "image_url": ref_data_url},
-                    {"type": "input_image", "image_url": rep_data_url},
-                ],
-            }],
-            tools=[{"type": "image_generation", "model": "gpt-image-1"}],
-            tool_choice={"type": "image_generation"},
-        )
-        # Dump trimmed structure
-        d = resp.model_dump() if hasattr(resp, "model_dump") else resp
-        import json
-        def trim(x):
-            if isinstance(x, dict):
-                return {k: trim(v) for k, v in list(x.items())[:5]}
-            if isinstance(x, list):
-                return [trim(v) for v in x[:3]]
-            if isinstance(x, str) and len(x) > 150:
-                return x[:150]+"...(trim)"
-            return x
-        return trim(d)
-    except Exception as e:
-        return {"error": str(e)}
-
-
 def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target_size: str = "1024x1024") -> str:
     """
     Compose via Responses API using gpt-4.1 + image_generation tool.
@@ -139,31 +109,42 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
         f"Output a clean photorealistic composite (target size {target_size})."
     )
 
-    resp = client.responses.create(
-        model="gpt-4.1",
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": ref_data_url},
-                {"type": "input_image", "image_url": rep_data_url},
-            ],
-        }],
-        tools=[{"type": "image_generation", "model": "gpt-image-1"}],
-        tool_choice={"type": "image_generation"},
-    )
+    try:
+        resp = client.responses.create(
+            model="gpt-4.1",
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": ref_data_url},
+                    {"type": "input_image", "image_url": rep_data_url},
+                ],
+            }],
+            tools=[{"type": "image_generation", "model": "gpt-image-1"}],
+            tool_choice={"type": "image_generation"},
+        )
+    except Exception as e:
+        # Make the error message explicit so we can see if it is a 404 from OpenAI
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        url = getattr(getattr(getattr(e, "response", None), "request", None), "url", None)
+        body = None
+        try:
+            body = getattr(e, "response", None).text[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"OpenAI call failed (status={status}, url={url}) body={body}")
 
-    # ---- Robust extractor ----
+    # ---- Extract base64 image from the Responses output ----
     b64 = None
     out = getattr(resp, "output", None) or []
     for item in out:
         itype = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
         # Case 1: new schema → result field
-        if itype == "image_generation_call" and hasattr(item, "result") or (isinstance(item, dict) and "result" in item):
+        if itype == "image_generation_call" and (hasattr(item, "result") or (isinstance(item, dict) and "result" in item)):
             b64 = getattr(item, "result", None) or (item.get("result") if isinstance(item, dict) else None)
             if b64:
                 break
-        # Case 2: old schema → content with output_image
+        # Case 2: old schema → output_image
         content = getattr(item, "content", None) or (isinstance(item, dict) and item.get("content")) or []
         for c in content:
             ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
@@ -179,6 +160,7 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
         raise RuntimeError("No image returned from image_generation tool")
 
     return b64
+
 
 def draft_kling_prompt_with_openai(scene_notes: str, aspect: str, duration: int) -> str:
     sys = (
@@ -200,6 +182,7 @@ Scene details / product context: {scene_notes}
         temperature=0.8,
     )
     return r.choices[0].message.content.strip()
+
 
 async def create_kling_task(prompt: str, image_url: str, aspect: str, duration: int) -> str:
     url = "https://api.piapi.ai/api/kling/v2.1/video"
@@ -224,6 +207,7 @@ async def create_kling_task(prompt: str, image_url: str, aspect: str, duration: 
             raise HTTPException(status_code=500, detail=f"Unexpected PiAPI response: {data}")
         return task_id
 
+
 async def get_kling_task(task_id: str) -> dict:
     url = f"https://api.piapi.ai/api/kling/v2.1/task/{task_id}"
     headers = {"Authorization": f"Bearer {settings.PIAPI_API_KEY}"}
@@ -232,6 +216,7 @@ async def get_kling_task(task_id: str) -> dict:
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp.json()
+
 
 # ----------------------
 # API Endpoints
@@ -265,6 +250,7 @@ async def compose(
     task_id = await create_kling_task(prompt, composite_url, aspect, duration)
     return ComposeResponse(composite_url=composite_url, task_id=task_id, prompt=prompt)
 
+
 @app.get("/api/task/{task_id}", response_model=TaskResponse)
 async def task_status(task_id: str):
     data = await get_kling_task(task_id)
@@ -272,6 +258,7 @@ async def task_status(task_id: str):
     video_url = data.get("video_url") or (data.get("result", {}) if isinstance(data.get("result"), dict) else {}).get("url")
     detail = json.dumps(data)
     return TaskResponse(status=status, video_url=video_url, detail=detail)
+
 
 @app.post("/api/share")
 async def create_share(payload: dict):
@@ -287,6 +274,7 @@ async def create_share(payload: dict):
         c.commit()
     return {"slug": slug, "url": f"{settings.SPACE_HOST}/v/{slug}"}
 
+
 @app.get("/v/{slug}", response_class=HTMLResponse)
 async def view_share(slug: str):
     with db() as c:
@@ -299,8 +287,42 @@ async def view_share(slug: str):
     video_url = data.get("video_url") or (data.get("result", {}) if isinstance(data.get("result"), dict) else {}).get("url") or ""
     return HTMLResponse(f"<h1>Share</h1><img src='{composite_url}' /><pre>{prompt}</pre><video src='{video_url}' controls></video>")
 
+
+# ---- Debug endpoints to test connectivity ----
+@app.get("/api/debug/openai-ping")
+def openai_ping():
+    try:
+        r = client.responses.create(
+            model="gpt-4.1",
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}]
+        )
+        return {"ok": True, "model": getattr(r, "model", None)}
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        url = getattr(getattr(getattr(e, "response", None), "request", None), "url", None)
+        body = None
+        try:
+            body = getattr(e, "response", None).text[:300]
+        except Exception:
+            pass
+        return {"ok": False, "where": "openai", "status": status, "url": str(url), "error": str(e), "body": body}
+
+
+@app.get("/api/debug/piapi-ping")
+async def piapi_ping():
+    import httpx
+    test_url = "https://api.piapi.ai/api/kling/v2.1/task/does-not-exist"
+    headers = {"Authorization": f"Bearer {os.getenv('PIAPI_API_KEY','')}"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as x:
+            resp = await x.get(test_url, headers=headers)
+        return {"ok": resp.status_code in (401, 404), "status": resp.status_code, "url": test_url, "body": resp.text[:300]}
+    except Exception as e:
+        return {"ok": False, "where": "piapi", "error": str(e)}
+
+
 # ----------------------
-# Serve frontend (after APIs, avoids swallowing POST)
+# Serve frontend last (avoid swallowing /api routes)
 # ----------------------
 FRONTEND_DIR = (BASE_DIR.parent / "frontend")
 if FRONTEND_DIR.exists():
@@ -314,9 +336,11 @@ else:
     async def root_fallback():
         return HTMLResponse("<h1>Lumera API</h1><p>Frontend not found. Try /api/health or /docs.</p>")
 
+
 @app.get("/api/health")
 async def health():
     return {"ok": True}
+
 
 if __name__ == "__main__":
     import uvicorn
