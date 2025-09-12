@@ -246,11 +246,9 @@ async def get_kling_task(task_id: str) -> dict:
 # API Endpoints
 # ----------------------
 
-def build_public_url_from_request(request: Request, path: str) -> str:
-    host_env = (settings.SPACE_HOST or "").rstrip("/")
-    req_origin = str(request.base_url).rstrip("/")
-    base = host_env if host_env else req_origin
-    return f"{base}/{path.lstrip('/')}"
+def public_url(request: Request, path: str) -> str:
+    # Always use the host the request came in on
+    return str(request.base_url).rstrip("/") + "/" + path.lstrip("/")
 
 @app.post("/api/compose", response_model=ComposeResponse)
 async def compose(
@@ -260,26 +258,25 @@ async def compose(
     duration: int = Form(5),
     notes: Optional[str] = Form(None),
 ):
-    # 1) Read & save reference image (we store as PNG so it’s easy to serve)
+    # 1) Save the uploaded image
     ref_bytes = await reference.read()
     file_id = uuid.uuid4().hex
     ref_name = f"reference_{file_id}.png"
     ref_path = OUT_DIR / ref_name
-
     with open(ref_path, "wb") as f:
         f.write(ref_bytes)
 
-    # ✅ Build URL from the actual request host (fallback-safe if SPACE_HOST is wrong)
-    reference_url = build_public_url_from_request(request, f"/outputs/{ref_name}")
-    print("DEBUG reference_url →", reference_url)  # optional: see which URL PiAPI will get
+    # ✅ Build URL from THIS request’s host (ignores stale SPACE_HOST)
+    reference_url = public_url(request, f"/outputs/{ref_name}")
+    print("DEBUG reference_url →", reference_url)  # check Render logs
 
-    # 2) Draft Kling prompt from the reference image (OpenAI)
+    # 2) Draft Kling prompt
     try:
         kling_prompt = generate_kling_prompt_from_image(ref_bytes, aspect, duration, notes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"prompt_from_image failed: {e}")
 
-    # 3) Create Kling task (image-to-video using the same reference image URL)
+    # 3) Create Kling task with that URL
     try:
         task_id = await create_kling_task(kling_prompt, reference_url, aspect, duration)
     except HTTPException as e:
@@ -287,9 +284,7 @@ async def compose(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"piapi_create failed: {e}")
 
-    # Reuse ComposeResponse fields: composite_url now is the reference URL
     return ComposeResponse(composite_url=reference_url, task_id=task_id, prompt=kling_prompt)
-    
     
 @app.get("/api/task/{task_id}", response_model=TaskResponse)
 async def task_status(task_id: str):
