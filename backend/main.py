@@ -109,10 +109,15 @@ def generate_kling_prompt_from_image(reference_bytes: bytes, aspect: str, durati
     user_instruction = f"""
 You are crafting a **Kling v2.1** animation prompt from ONE reference image.
 
+You are crafting a **Kling v2.1** animation prompt from ONE reference image.
+
+Goal: write a cinematic animation prompt that captures the *style* and *motion* of the scene,
+**without naming the exact product or giving brand-specific or color-specific details**.
+
 1) Understand the Image Context
-- Identify main subject (product/person/object)
-- Environment (studio, outdoor, city, cozy room, etc.)
-- Colors, textures, mood (warm, luxury, dreamy, energetic)
+- Identify the type of subject (e.g. “the product”, “the object”, “the item”) **but never describe brand, color or model**.
+- Summarise the environment (studio, outdoor, city, cozy room, etc.).
+- Capture overall mood (warm, luxury, dreamy, energetic) without product-specific adjectives.
 
 2) Build the Animation Prompt (concise, under ~1200 chars)
 Always create MOTION in three layers:
@@ -122,14 +127,15 @@ A. Camera Dynamics (choose 1–2 moves total)
 
 B. Scene & Subject Motion (pick 2–3 tasteful details)
 - environment: fabric/smoke/fog, petals/leaves/snow/particles, waves/ripples/wind/reflections, shadows passing, neon flicker
-- subject: subtle product rotate/glow/shimmer; person hair/cloth reacts; light rays crossing subject
+- subject: subtle rotation/glow/shimmer of *the product*; hair/cloth reacts; light rays crossing subject
 
 C. Lighting & Atmosphere (pick 1–2)
 - golden hour glow, neon reflections, candlelight flicker, rain droplets reflections, lens flare, dreamy haze, spotlight beams
 
 Constraints:
-- Photorealistic. Respect subject identity from the image.
-- No new objects or text overlays.
+- Say only “the product” or “the object” when referring to the main subject.
+- Do not mention brand names, logos, text, or specific colours.
+- Photorealistic. Respect the overall composition and mood.
 - Keep motion subtle and elegant, avoid warping.
 - Output should be a SINGLE paragraph Kling prompt.
 
