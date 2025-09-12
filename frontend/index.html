@@ -17,6 +17,14 @@
     img,video{max-width:100%;border-radius:12px}
     .mono{font-family:ui-monospace,Menlo,monospace}
     .actions{display:flex;gap:10px;flex-wrap:wrap}
+    .prompt-box {
+  max-height: 180px;       /* show ~6–8 lines */
+  overflow-y: auto;        /* vertical scroll if longer */
+  padding: 10px;
+  background: #f9fafb;     /* subtle gray background */
+  border-radius: 8px;
+  white-space: pre-wrap;   /* keep line breaks, wrap long lines */
+}
   </style>
 </head>
 <body>
@@ -55,10 +63,11 @@
     </div>
   </div>
 
-  <div class="card">
-    <h3>🎬 Kling Prompt</h3>
-    <pre id="prompt" class="mono"></pre>
-  </div>
+<div class="card">
+  <h3>🎬 Kling Prompt</h3>
+  <pre id="prompt" class="mono prompt-box"></pre>
+  <button id="copyPrompt">Copy</button>
+</div>
 
   <div class="card">
     <h3>📡 Status</h3>
@@ -77,6 +86,24 @@
     let lastTaskId = null;
     let lastImageUrl = null;
     let lastPrompt = null;
+
+    const q = new URLSearchParams(location.search);
+    const LS_KEY = "lumera:lastTask";
+
+    function saveTaskState(state){
+      localStorage.setItem(LS_KEY, JSON.stringify(state));
+    }
+    function loadTaskState(){
+      try { return JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch { return null; }
+    }
+    function clearTaskState(){
+      localStorage.removeItem(LS_KEY);
+    }
+    function setUrlTaskParam(taskId){
+      const url = new URL(location.href);
+      url.searchParams.set("task", taskId);
+      history.replaceState(null, "", url.toString());
+    }
 
     async function compose() {
       const reference = el('reference').files[0];
@@ -109,6 +136,9 @@
       lastTaskId = data.task_id;
       lastImageUrl = data.composite_url; // now the reference image URL
       lastPrompt = data.prompt;
+      
+      saveTaskState({ task_id: lastTaskId, image_url: lastImageUrl, prompt: lastPrompt });
+      setUrlTaskParam(lastTaskId);
 
       el('share').disabled = false;
 
@@ -141,10 +171,13 @@
         if (s === 'completed' && data.video_url) {
           el('video').src = data.video_url;
           el('status').textContent = '✅ Completed.';
+          clearTaskState();
+
           return;
         }
         if (s === 'failed') {
           el('status').textContent = '❌ Failed: ' + (data.detail || '');
+          clearTaskState();
           return;
         }
         setTimeout(tick, delay);
@@ -171,6 +204,32 @@
       }
       document.getElementById('shareUrl').value = data.url;
     }
+
+    window.addEventListener("DOMContentLoaded", async () => {
+  // Prefer URL param, else localStorage
+        const urlTask = q.get("task");
+        const saved = loadTaskState();
+
+        if (urlTask || saved?.task_id) {
+          const taskId = urlTask || saved.task_id;
+          lastTaskId   = taskId;
+          lastImageUrl = saved?.image_url || "";
+          lastPrompt   = saved?.prompt || "";
+
+          if (lastPrompt) document.getElementById('prompt').textContent = lastPrompt;
+          if (saved?.image_url) {
+            // (optional) show the reference image somewhere if you want
+          }
+
+          document.getElementById('share').disabled = false;
+          // resume polling
+          pollTask(taskId);
+        }
+  });
+    document.getElementById('copyPrompt').addEventListener('click', () => {
+  navigator.clipboard.writeText(document.getElementById('prompt').textContent);
+  alert('Prompt copied to clipboard!');
+});
 
     document.getElementById('go').addEventListener('click', () => {
       compose().catch(err => {
