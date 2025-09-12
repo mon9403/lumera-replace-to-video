@@ -185,39 +185,77 @@ Scene details / product context: {scene_notes}
 
 
 async def create_kling_task(prompt: str, image_url: str, aspect: str, duration: int) -> str:
-    url = "https://api.piapi.ai/api/kling/v2.1/video"
+    """
+    Creates a Kling task via PiAPI v1. 
+    Docs: POST https://api.piapi.ai/api/v1/task  (x-api-key header)
+    """
+    url = "https://api.piapi.ai/api/v1/task"
     headers = {
-        "Authorization": f"Bearer {settings.PIAPI_API_KEY}",
+        "x-api-key": settings.PIAPI_API_KEY,
         "Content-Type": "application/json",
     }
+
+    # PiAPI allowed values from the spec:
+    #  duration: 5 or 10
+    #  aspect_ratio: "16:9" | "9:16" | "1:1"  (only required for text-to-video, but harmless here)
+    #  mode: "std" | "pro"
+    #  version: "1.0" | "1.5" | "1.6" | "2.0" | "2.1" | "2.1-master"
+    # We’ll use 2.1 std by default.
     payload = {
-        "prompt": prompt,
-        "image_url": image_url,
-        "mode": "image_to_video",
-        "aspect_ratio": aspect,
-        "duration": duration,
+        "model": "kling",
+        "task_type": "video_generation",
+        "input": {
+            "prompt": prompt or "",
+            "duration": 5 if duration not in (5, 10) else duration,
+            "aspect_ratio": aspect if aspect in ("16:9", "9:16", "1:1") else "9:16",
+            "mode": "std",
+            "version": "2.1",
+            # Image-to-video trigger:
+            "image_url": image_url,   # MUST be public
+        },
+        "config": {
+            # optional; omit webhook unless you use it
+            # "service_mode": "public"
+        }
     }
+
     async with httpx.AsyncClient(timeout=120) as x:
         resp = await x.post(url, headers=headers, json=payload)
         if resp.status_code != 200:
+            # Surface full body so you can see PiAPI errors in the UI
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
         data = resp.json()
-        task_id = data.get("task_id") or data.get("id")
+        # Spec says: { code, data: { task_id, ... }, message }
+        task_id = (((data or {}).get("data") or {}).get("task_id")) or None
         if not task_id:
-            raise HTTPException(status_code=500, detail=f"Unexpected PiAPI response: {data}")
+            raise HTTPException(status_code=500, detail=f"Unexpected PiAPI response (no task_id): {data}")
         return task_id
 
-
 async def get_kling_task(task_id: str) -> dict:
-    url = f"https://api.piapi.ai/api/kling/v2.1/task/{task_id}"
-    headers = {"Authorization": f"Bearer {settings.PIAPI_API_KEY}"}
+    """
+    Polls a Kling task via PiAPI v1.
+    Docs: GET https://api.piapi.ai/api/v1/task/{task_id}  (x-api-key header)
+    """
+    url = f"https://api.piapi.ai/api/v1/task/{task_id}"
+    headers = {"x-api-key": settings.PIAPI_API_KEY}
+
     async with httpx.AsyncClient(timeout=60) as x:
         resp = await x.get(url, headers=headers)
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp.json()
 
-
+@app.get("/api/task/{task_id}", response_model=TaskResponse)
+async def task_status(task_id: str):
+    raw = await get_kling_task(task_id)
+    d = (raw or {}).get("data") or {}
+    status = d.get("status") or "unknown"
+    out = d.get("output") or {}
+    video_url = out.get("video_url")
+    detail = json.dumps(raw)
+    return TaskResponse(status=status, video_url=video_url, detail=detail)
+    
 # ----------------------
 # API Endpoints
 # ----------------------
