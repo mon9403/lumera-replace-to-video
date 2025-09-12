@@ -7,7 +7,7 @@ import secrets
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
@@ -245,8 +245,16 @@ async def get_kling_task(task_id: str) -> dict:
 # ----------------------
 # API Endpoints
 # ----------------------
+
+def build_public_url_from_request(request: Request, path: str) -> str:
+    host_env = (settings.SPACE_HOST or "").rstrip("/")
+    req_origin = str(request.base_url).rstrip("/")
+    base = host_env if host_env else req_origin
+    return f"{base}/{path.lstrip('/')}"
+
 @app.post("/api/compose", response_model=ComposeResponse)
 async def compose(
+    request: Request,
     reference: UploadFile = File(..., description="Reference image only"),
     aspect: str = Form("9:16"),
     duration: int = Form(5),
@@ -258,11 +266,12 @@ async def compose(
     ref_name = f"reference_{file_id}.png"
     ref_path = OUT_DIR / ref_name
 
-    # If it’s already a PNG/JPG we just write the bytes; save_base64_image expects b64, so do a simple write:
     with open(ref_path, "wb") as f:
         f.write(ref_bytes)
 
-    reference_url = f"{settings.SPACE_HOST.rstrip('/')}/outputs/{ref_name}"
+    # ✅ Build URL from the actual request host (fallback-safe if SPACE_HOST is wrong)
+    reference_url = build_public_url_from_request(request, f"/outputs/{ref_name}")
+    print("DEBUG reference_url →", reference_url)  # optional: see which URL PiAPI will get
 
     # 2) Draft Kling prompt from the reference image (OpenAI)
     try:
@@ -280,8 +289,8 @@ async def compose(
 
     # Reuse ComposeResponse fields: composite_url now is the reference URL
     return ComposeResponse(composite_url=reference_url, task_id=task_id, prompt=kling_prompt)
-
-
+    
+    
 @app.get("/api/task/{task_id}", response_model=TaskResponse)
 async def task_status(task_id: str):
     raw = await get_kling_task(task_id)
