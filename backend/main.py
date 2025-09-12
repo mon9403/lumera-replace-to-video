@@ -15,7 +15,7 @@ from pydantic_settings import BaseSettings
 from openai import OpenAI
 
 from models import ComposeResponse, TaskResponse
-from utils import save_base64_image
+from utils import save_base64_image  # still used to persist uploads (png passthrough)
 
 
 # ----------------------
@@ -33,9 +33,9 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-app = FastAPI(title="Lumera AI – Product Replace to Video")
+app = FastAPI(title="Lumera AI – Image → Kling Video")
 
-# Allow cross-origin for quick testing
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,21 +44,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Paths
+# Paths & static
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Serve generated outputs
 app.mount("/outputs", StaticFiles(directory=str(OUT_DIR)), name="outputs")
 
-# ✅ Force correct base_url so we never hit our own Render host by mistake
+# OpenAI client (force official base URL)
+for k in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_HOST", "OPENAI_URL"):
+    os.environ.pop(k, None)
+
 client = OpenAI(
     api_key=settings.OPENAI_API_KEY,
     base_url="https://api.openai.com/v1"
 )
 
-# SQLite for share links
+# Share-link DB
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "shares.db")))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 con = sqlite3.connect(DB_PATH)
@@ -88,12 +89,15 @@ def new_slug(n=6):
 
 
 # ----------------------
-# Helpers
+# OpenAI prompt from image
 # ----------------------
-def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target_size: str = "1024x1024") -> str:
+def generate_kling_prompt_from_image(reference_bytes: bytes, aspect: str, duration: int, notes: Optional[str]) -> str:
     """
-    Compose via Responses API using gpt-4.1 + image_generation tool.
-    Returns base64 PNG (no data URL).
+    Uses Responses API (gpt-4.1) with vision to:
+      1) Understand the image (subject, environment, palette/mood)
+      2) Produce a Kling v2.1 prompt using your 3-layer structure:
+         A) Camera Dynamics, B) Scene & Subject Motion, C) Lighting & Atmosphere
+    Returns: prompt text (string).
     """
     import base64
 
@@ -101,93 +105,86 @@ def compose_with_openai(reference_bytes: bytes, replacement_bytes: bytes, target
         return f"data:{mime};base64," + base64.b64encode(b).decode("utf-8")
 
     ref_data_url = to_data_url(reference_bytes)
-    rep_data_url = to_data_url(replacement_bytes)
 
-    prompt = (
-        "Replace the old product in the scene (first image) with the new product from the second image. "
-        "Match perspective, lighting, shadows, and reflections. Maintain the original background. "
-        f"Output a clean photorealistic composite (target size {target_size})."
-    )
+    user_instruction = f"""
+You are crafting a **Kling v2.1** animation prompt from ONE reference image.
 
-    try:
-        resp = client.responses.create(
-            model="gpt-4.1",
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": ref_data_url},
-                    {"type": "input_image", "image_url": rep_data_url},
-                ],
-            }],
-            tools=[{"type": "image_generation", "model": "gpt-image-1"}],
-            tool_choice={"type": "image_generation"},
-        )
-    except Exception as e:
-        # Make the error message explicit so we can see if it is a 404 from OpenAI
-        status = getattr(getattr(e, "response", None), "status_code", None)
-        url = getattr(getattr(getattr(e, "response", None), "request", None), "url", None)
-        body = None
-        try:
-            body = getattr(e, "response", None).text[:300]
-        except Exception:
-            pass
-        raise RuntimeError(f"OpenAI call failed (status={status}, url={url}) body={body}")
+1) Understand the Image Context
+- Identify main subject (product/person/object)
+- Environment (studio, outdoor, city, cozy room, etc.)
+- Colors, textures, mood (warm, luxury, dreamy, energetic)
 
-    # ---- Extract base64 image from the Responses output ----
-    b64 = None
-    out = getattr(resp, "output", None) or []
-    for item in out:
-        itype = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
-        # Case 1: new schema → result field
-        if itype == "image_generation_call" and (hasattr(item, "result") or (isinstance(item, dict) and "result" in item)):
-            b64 = getattr(item, "result", None) or (item.get("result") if isinstance(item, dict) else None)
-            if b64:
-                break
-        # Case 2: old schema → output_image
-        content = getattr(item, "content", None) or (isinstance(item, dict) and item.get("content")) or []
-        for c in content:
-            ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
-            if ctype == "output_image":
-                img = getattr(c, "image", None) or (isinstance(c, dict) and c.get("image")) or {}
-                b64 = getattr(img, "b64_json", None) or (isinstance(img, dict) and img.get("b64_json"))
-                if b64:
-                    break
-        if b64:
-            break
+2) Build the Animation Prompt (concise, under ~1200 chars)
+Always create MOTION in three layers:
 
-    if not b64:
-        raise RuntimeError("No image returned from image_generation tool")
+A. Camera Dynamics (choose 1–2 moves total)
+- zoom in/out, pan/tilt, orbit, dolly push/pull, rack focus
 
-    return b64
+B. Scene & Subject Motion (pick 2–3 tasteful details)
+- environment: fabric/smoke/fog, petals/leaves/snow/particles, waves/ripples/wind/reflections, shadows passing, neon flicker
+- subject: subtle product rotate/glow/shimmer; person hair/cloth reacts; light rays crossing subject
 
+C. Lighting & Atmosphere (pick 1–2)
+- golden hour glow, neon reflections, candlelight flicker, rain droplets reflections, lens flare, dreamy haze, spotlight beams
 
-def draft_kling_prompt_with_openai(scene_notes: str, aspect: str, duration: int) -> str:
-    sys = (
-        "You are a creative director writing concise prompts for Kling v2.1. "
-        "Keep under 1400 chars. Be explicit about camera moves, lighting, and pacing."
-    )
-    user = f"""
-Create a cinematic animation prompt for Kling v2.1.
-Aspect: {aspect}
-Duration: {duration}s
-Scene details / product context: {scene_notes}
+Constraints:
+- Photorealistic. Respect subject identity from the image.
+- No new objects or text overlays.
+- Keep motion subtle and elegant, avoid warping.
+- Output should be a SINGLE paragraph Kling prompt.
+
+Target:
+- Aspect: {aspect}
+- Duration: {duration}s
+{"- Extra creative direction: " + notes if notes else ""}
 """
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.8,
+
+    resp = client.responses.create(
+        model="gpt-4.1",
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": user_instruction},
+                {"type": "input_image", "image_url": ref_data_url},
+            ],
+        }],
     )
-    return r.choices[0].message.content.strip()
+
+    # Extract text robustly
+    text = ""
+    # Newer SDKs often expose output_text directly:
+    if hasattr(resp, "output_text") and isinstance(resp.output_text, str) and resp.output_text.strip():
+        text = resp.output_text.strip()
+    else:
+        out = getattr(resp, "output", None) or []
+        for item in out:
+            itype = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
+            if itype != "message":
+                continue
+            content = getattr(item, "content", None) or (isinstance(item, dict) and item.get("content")) or []
+            for c in content:
+                ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
+                if ctype == "output_text":
+                    txt = getattr(c, "text", None) or (isinstance(c, dict) and c.get("text"))
+                    if isinstance(txt, str) and txt.strip():
+                        text = txt.strip()
+                        break
+            if text:
+                break
+
+    if not text:
+        raise RuntimeError("No prompt text returned from OpenAI.")
+
+    return text
 
 
+# ----------------------
+# PiAPI v1 (Kling) – create & poll
+# ----------------------
 async def create_kling_task(prompt: str, image_url: str, aspect: str, duration: int) -> str:
     """
-    Creates a Kling task via PiAPI v1. 
-    Docs: POST https://api.piapi.ai/api/v1/task  (x-api-key header)
+    PiAPI v1 create task (x-api-key). We use image-to-video via image_url+prompt.
+    POST https://api.piapi.ai/api/v1/task
     """
     url = "https://api.piapi.ai/api/v1/task"
     headers = {
@@ -195,12 +192,9 @@ async def create_kling_task(prompt: str, image_url: str, aspect: str, duration: 
         "Content-Type": "application/json",
     }
 
-    # PiAPI allowed values from the spec:
-    #  duration: 5 or 10
-    #  aspect_ratio: "16:9" | "9:16" | "1:1"  (only required for text-to-video, but harmless here)
-    #  mode: "std" | "pro"
-    #  version: "1.0" | "1.5" | "1.6" | "2.0" | "2.1" | "2.1-master"
-    # We’ll use 2.1 std by default.
+    version = os.getenv("KLING_VERSION", "2.1")
+    mode = os.getenv("KLING_MODE", "std")
+
     payload = {
         "model": "kling",
         "task_type": "video_generation",
@@ -208,43 +202,79 @@ async def create_kling_task(prompt: str, image_url: str, aspect: str, duration: 
             "prompt": prompt or "",
             "duration": 5 if duration not in (5, 10) else duration,
             "aspect_ratio": aspect if aspect in ("16:9", "9:16", "1:1") else "9:16",
-            "mode": "std",
-            "version": "2.1",
-            # Image-to-video trigger:
-            "image_url": image_url,   # MUST be public
+            "mode": mode if mode in ("std", "pro") else "std",
+            "version": version,
+            "image_url": image_url,  # initial frame (must be public)
         },
-        "config": {
-            # optional; omit webhook unless you use it
-            # "service_mode": "public"
-        }
     }
 
     async with httpx.AsyncClient(timeout=120) as x:
         resp = await x.post(url, headers=headers, json=payload)
-        if resp.status_code != 200:
-            # Surface full body so you can see PiAPI errors in the UI
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-        data = resp.json()
-        # Spec says: { code, data: { task_id, ... }, message }
-        task_id = (((data or {}).get("data") or {}).get("task_id")) or None
-        if not task_id:
-            raise HTTPException(status_code=500, detail=f"Unexpected PiAPI response (no task_id): {data}")
-        return task_id
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    data = resp.json() or {}
+    d = data.get("data") or {}
+    if d.get("status") == "failed":
+        err = d.get("error") or {}
+        raise HTTPException(status_code=402, detail=f"PiAPI error: {err}")
+
+    task_id = d.get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=500, detail=f"Unexpected PiAPI response (no task_id): {data}")
+    return task_id
+
 
 async def get_kling_task(task_id: str) -> dict:
-    """
-    Polls a Kling task via PiAPI v1.
-    Docs: GET https://api.piapi.ai/api/v1/task/{task_id}  (x-api-key header)
-    """
     url = f"https://api.piapi.ai/api/v1/task/{task_id}"
     headers = {"x-api-key": settings.PIAPI_API_KEY}
-
     async with httpx.AsyncClient(timeout=60) as x:
         resp = await x.get(url, headers=headers)
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp.json()
+
+
+# ----------------------
+# API Endpoints
+# ----------------------
+@app.post("/api/compose", response_model=ComposeResponse)
+async def compose(
+    reference: UploadFile = File(..., description="Reference image only"),
+    aspect: str = Form("9:16"),
+    duration: int = Form(5),
+    notes: Optional[str] = Form(None),
+):
+    # 1) Read & save reference image (we store as PNG so it’s easy to serve)
+    ref_bytes = await reference.read()
+    file_id = uuid.uuid4().hex
+    ref_name = f"reference_{file_id}.png"
+    ref_path = OUT_DIR / ref_name
+
+    # If it’s already a PNG/JPG we just write the bytes; save_base64_image expects b64, so do a simple write:
+    with open(ref_path, "wb") as f:
+        f.write(ref_bytes)
+
+    reference_url = f"{settings.SPACE_HOST.rstrip('/')}/outputs/{ref_name}"
+
+    # 2) Draft Kling prompt from the reference image (OpenAI)
+    try:
+        kling_prompt = generate_kling_prompt_from_image(ref_bytes, aspect, duration, notes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"prompt_from_image failed: {e}")
+
+    # 3) Create Kling task (image-to-video using the same reference image URL)
+    try:
+        task_id = await create_kling_task(kling_prompt, reference_url, aspect, duration)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"piapi_create failed: {e.detail}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"piapi_create failed: {e}")
+
+    # Reuse ComposeResponse fields: composite_url now is the reference URL
+    return ComposeResponse(composite_url=reference_url, task_id=task_id, prompt=kling_prompt)
+
 
 @app.get("/api/task/{task_id}", response_model=TaskResponse)
 async def task_status(task_id: str):
@@ -253,55 +283,13 @@ async def task_status(task_id: str):
     status = d.get("status") or "unknown"
     out = d.get("output") or {}
     video_url = out.get("video_url")
-    detail = json.dumps(raw)
-    return TaskResponse(status=status, video_url=video_url, detail=detail)
-    
-# ----------------------
-# API Endpoints
-# ----------------------
-@app.post("/api/compose", response_model=ComposeResponse)
-async def compose(
-    reference: UploadFile = File(...),
-    replacement: UploadFile = File(...),
-    aspect: str = Form("9:16"),
-    duration: int = Form(5),
-    notes: Optional[str] = Form(None),
-):
-    ref_bytes = await reference.read()
-    rep_bytes = await replacement.read()
-
-    try:
-        b64 = compose_with_openai(ref_bytes, rep_bytes, target_size="1024x1024")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI composition failed: {e}")
-
-    file_id = uuid.uuid4().hex
-    composite_name = f"composite_{file_id}.png"
-    composite_path = OUT_DIR / composite_name
-    save_base64_image(b64, str(composite_path))
-
-    composite_url = f"{settings.SPACE_HOST}/outputs/{composite_name}"
-
-    scene_notes = notes or "Product placed naturally into the reference scene."
-    prompt = draft_kling_prompt_with_openai(scene_notes, aspect, duration)
-
-    task_id = await create_kling_task(prompt, composite_url, aspect, duration)
-    return ComposeResponse(composite_url=composite_url, task_id=task_id, prompt=prompt)
-
-
-@app.get("/api/task/{task_id}", response_model=TaskResponse)
-async def task_status(task_id: str):
-    data = await get_kling_task(task_id)
-    status = data.get("status") or data.get("state") or "unknown"
-    video_url = data.get("video_url") or (data.get("result", {}) if isinstance(data.get("result"), dict) else {}).get("url")
-    detail = json.dumps(data)
-    return TaskResponse(status=status, video_url=video_url, detail=detail)
+    return TaskResponse(status=status, video_url=video_url, detail=json.dumps(raw))
 
 
 @app.post("/api/share")
 async def create_share(payload: dict):
     task_id = payload.get("task_id")
-    composite_url = payload.get("composite_url")
+    composite_url = payload.get("composite_url")  # now: reference_url
     prompt = payload.get("prompt")
     if not (task_id and composite_url):
         raise HTTPException(status_code=400, detail="task_id and composite_url required")
@@ -310,7 +298,7 @@ async def create_share(payload: dict):
         c.execute("INSERT INTO shares(slug, task_id, composite_url, prompt) VALUES(?,?,?,?)",
                   (slug, task_id, composite_url, prompt or ""))
         c.commit()
-    return {"slug": slug, "url": f"{settings.SPACE_HOST}/v/{slug}"}
+    return {"slug": slug, "url": f"{settings.SPACE_HOST.rstrip('/')}/v/{slug}"}
 
 
 @app.get("/v/{slug}", response_class=HTMLResponse)
@@ -320,13 +308,35 @@ async def view_share(slug: str):
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    task_id, composite_url, prompt = row
+    task_id, image_url, prompt = row
     data = await get_kling_task(task_id)
-    video_url = data.get("video_url") or (data.get("result", {}) if isinstance(data.get("result"), dict) else {}).get("url") or ""
-    return HTMLResponse(f"<h1>Share</h1><img src='{composite_url}' /><pre>{prompt}</pre><video src='{video_url}' controls></video>")
+    d = (data or {}).get("data") or {}
+    video_url = (d.get("output") or {}).get("video_url") or ""
+
+    def esc(s: str) -> str:
+        return (s or "").replace("<","&lt;").replace(">","&gt;")
+
+    html = f"""
+    <!doctype html>
+    <html><head><meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lumera Share</title>
+    <style>body{{font-family:ui-sans-serif,system-ui,Arial;padding:24px;max-width:720px;margin:auto}}
+    .card{{border:1px solid #e5e7eb;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+    img,video{{max-width:100%;border-radius:12px}}</style></head>
+    <body>
+      <h1>🔗 Share – Lumera</h1>
+      <div class="card"><h3>🖼️ Reference</h3><img src="{image_url}" /></div>
+      <div class="card"><h3>🎬 Kling Prompt</h3><pre>{esc(prompt)}</pre></div>
+      <div class="card"><h3>📺 Video</h3>{(f'<video src="{video_url}" controls playsinline></video>' if video_url else '<em>Rendering… refresh later.</em>')}</div>
+      <div class="card"><a href="/">Create your own →</a></div>
+      <script>if(!{str(bool(video_url)).lower()})setTimeout(()=>location.reload(),5000);</script>
+    </body></html>
+    """
+    return HTMLResponse(html)
 
 
-# ---- Debug endpoints to test connectivity ----
+# ---- Debug pings (optional) ----
 @app.get("/api/debug/openai-ping")
 def openai_ping():
     try:
@@ -348,9 +358,8 @@ def openai_ping():
 
 @app.get("/api/debug/piapi-ping")
 async def piapi_ping():
-    import httpx
-    test_url = "https://api.piapi.ai/api/kling/v2.1/task/does-not-exist"
-    headers = {"Authorization": f"Bearer {os.getenv('PIAPI_API_KEY','')}"}
+    test_url = "https://api.piapi.ai/api/v1/task/does-not-exist"
+    headers = {"x-api-key": settings.PIAPI_API_KEY}
     try:
         async with httpx.AsyncClient(timeout=20) as x:
             resp = await x.get(test_url, headers=headers)
@@ -360,7 +369,7 @@ async def piapi_ping():
 
 
 # ----------------------
-# Serve frontend last (avoid swallowing /api routes)
+# Frontend (served last)
 # ----------------------
 FRONTEND_DIR = (BASE_DIR.parent / "frontend")
 if FRONTEND_DIR.exists():
