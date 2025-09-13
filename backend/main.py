@@ -107,35 +107,42 @@ def generate_kling_prompt_from_image(reference_bytes: bytes, aspect: str, durati
     ref_data_url = to_data_url(reference_bytes)
 
     user_instruction = f"""
-You are crafting a **Kling v2.1** animation prompt from ONE reference image.
+1. Understand the Image Context
+        Identify the main subject (product, person, or object).
+        Note the environment (studio, outdoor, futuristic city, cozy room, etc.).
+        Capture colors, textures, and mood (warm, luxury, dreamy, energetic).
 
-Goal: write a cinematic animation prompt that captures the *style* and *motion* of the scene,
-**without naming the exact product or giving brand-specific or color-specific details**.
 
-1) Understand the Image Context
-- Identify the type of subject (e.g. “the product”, “the object”, “the item”) **but never describe brand, color or model**.
-- Summarise the environment (studio, outdoor, city, cozy room, etc.).
-- Capture overall mood (warm, luxury, dreamy, energetic) without product-specific adjectives.
+2. Build the Animation Prompt
 
-2) Build the Animation Prompt (concise, under ~1200 chars)
-Always create MOTION in three layers:
+Always create motion in three layers:
 
-A. Camera Dynamics (choose 1–2 moves total)
-- zoom in/out, pan/tilt, orbit, dolly push/pull, rack focus
+ A. Camera Dynamics
+        Choose cinematic moves:
+        Zoom in/out (dramatic reveal or emphasis)
+        Pan/tilt (side-to-side, up/down)
+        Orbit (circle around subject)
+        Dolly push/pull (3D cinematic movement)
+        Rack focus (blur background, focus product/person)
 
-B. Scene & Subject Motion (pick 2–3 tasteful details)
-- environment: fabric/smoke/fog, petals/leaves/snow/particles, waves/ripples/wind/reflections, shadows passing, neon flicker
-- subject: subtle rotation/glow/shimmer of *the product*; hair/cloth reacts; light rays crossing subject
+ B. Scene & Subject Motion
+        Add environmental actions:
+        Flowing fabric, smoke, or fog
+        Falling petals, leaves, snow, sparks, particles
+        Waves, ripples, wind, reflections
+        Crowd movement, shadows passing, neon flicker
+        Add subject-related interactions:
+        Product rotating, glowing edges, opening/closing lids
+        Person's hair/clothes reacting to wind
+        Light rays crossing over the subject
 
-C. Lighting & Atmosphere (pick 1–2)
-- golden hour glow, neon reflections, candlelight flicker, rain droplets reflections, lens flare, dreamy haze, spotlight beams
-
-Constraints:
-- Say only “the product” or “the object” when referring to the main subject.
-- Do not mention brand names, logos, text, or specific colours.
-- Photorealistic. Respect the overall composition and mood.
-- Keep motion subtle and elegant, avoid warping.
-- Output should be a SINGLE paragraph Kling prompt.
+ C. Lighting & Atmosphere
+    Add cinematic drama:
+        Golden hour glow
+        Neon reflections
+        Candlelight flicker
+        Rain droplets with reflections
+        Lens flare, dreamy haze, spotlight beams
 
 Target:
 - Aspect: {aspect}
